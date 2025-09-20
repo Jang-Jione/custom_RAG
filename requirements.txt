@@ -1,0 +1,4 @@
+mcp
+faiss-cpu
+sentence-transformers
+openai

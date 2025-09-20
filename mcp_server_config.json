@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "filesystem_git": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}
