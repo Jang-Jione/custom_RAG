@@ -24,8 +24,18 @@ def list_directory(path: str = ".") -> str:
 def read_file(path: str) -> str:
     """파일 내용을 문자열로 반환"""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", m="utf-8") as f:
             return f.read()
+    except Exception as e:
+        return f"Error: {str(e)}"
+    
+@mcp.tool()
+def write_file(path: str, content: str) -> str:
+    """파일에 문자열을 저장 (기존 내용 덮어쓰기)"""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"✅ {path} 저장 완료"
     except Exception as e:
         return f"Error: {str(e)}"
 

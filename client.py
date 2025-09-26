@@ -6,6 +6,7 @@ from mcp.client.stdio import stdio_client
 from rag import FileRAG
 from llm_api import query_gpt
 
+
 async def run_session(target_dir: str):
     with open("mcp_server_config.json") as f:
         config = json.load(f)["mcpServers"]["filesystem_git"]
@@ -27,13 +28,20 @@ async def run_session(target_dir: str):
 
         for fname in files:
             fname = fname.strip()
-            if fname.endswith((".py", ".md", ".txt")):
-                # 이미 list_directory가 상대경로로 반환하므로 target_dir 붙일 필요 없음
-                file_resp = await session.call_tool("read_file", {"path": os.path.join(target_dir, fname)})
-                content = file_resp.content[0].text
-                file_dict[fname] = content
+            # ✅ PDF까지 지원
+            if fname.endswith((".py", ".md", ".txt", ".pdf")):
+                path = os.path.join(target_dir, fname)
+                if fname.lower().endswith(".pdf"):
+                    # PDF는 rag에서 텍스트 추출 → 경로만 넘김
+                    file_dict[fname] = path
+                else:
+                    # 일반 텍스트 파일은 바로 읽어오기
+                    file_resp = await session.call_tool("read_file", {"path": path})
+                    content = file_resp.content[0].text
+                    file_dict[fname] = content
 
         print(f"총 {len(file_dict)}개 파일 로드 완료")
+        print("로드된 파일:", list(file_dict.keys()))
 
         # 📌 RAG 인덱스 구축
         rag = FileRAG()
@@ -54,7 +62,6 @@ async def run_session(target_dir: str):
                 continue
 
             if user_input.lower().startswith("commit"):
-                # commit "메시지" 형식
                 parts = user_input.split(" ", 1)
                 if len(parts) == 2:
                     msg = parts[1].strip('"')
@@ -69,13 +76,45 @@ async def run_session(target_dir: str):
                 print(result.content[0].text)
                 continue
 
+            if user_input.lower().startswith("save"):
+                # save filename.py
+                parts = user_input.split(" ", 1)
+                if len(parts) == 2:
+                    fname = parts[1].strip()
+                    print(f"저장할 파일명: {fname}")
+                    new_code = input("붙여넣을 코드 내용을 입력하세요 (끝내려면 빈 줄 입력):\n")
+                    buffer = []
+                    while new_code.strip() != "":
+                        buffer.append(new_code)
+                        new_code = input()
+                    content = "\n".join(buffer)
+
+                    result = await session.call_tool(
+                        "write_file",
+                        {"path": os.path.join(target_dir, fname), "content": content}
+                    )
+                    print(result.content[0].text)
+                else:
+                    print("❌ 저장할 파일명을 입력하세요. 예: save test.py")
+                continue
+
             # GPT 분석 요청
             related_files = rag.search(user_input, top_k=3)
-            context = "\n\n".join([f"[{fname}]\n{file_dict[fname]}" for fname in related_files])
+
+            # ✅ rag.docs에서 본문 꺼내오기
+            context_parts = []
+            for fname in related_files:
+                for doc_fname, doc_text in rag.docs:
+                    if doc_fname == fname:
+                        context_parts.append(f"[{fname}]\n{doc_text}")
+                        break
+
+            context = "\n\n".join(context_parts)
+
             prompt = f"""
             You are a coding assistant.  
 
-            Here is the project context (code files):
+            Here is the project context (code/files):
 
             {context}
 
@@ -86,7 +125,7 @@ async def run_session(target_dir: str):
             ---
 
             Task:
-            - Use the given context (code) as the primary source of information.
+            - Use the given context (code/files) as the primary source of information.
             - Answer the user request clearly and accurately.
             - If the request is about improvements, suggest concrete and actionable improvements to the code.
             - If the request is about explanation, explain the relevant parts of the code step by step.
@@ -94,6 +133,7 @@ async def run_session(target_dir: str):
             """
             analysis = query_gpt(prompt)
             print(analysis)
+
 
 if __name__ == "__main__":
     target_dir = sys.argv[1] if len(sys.argv) > 1 else "."
