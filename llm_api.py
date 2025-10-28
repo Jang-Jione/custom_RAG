@@ -3,7 +3,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import os
 
-load_dotenv()  # ✅ .env 파일 자동 로드
+load_dotenv()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 def query_gpt(prompt: str, model: str = "gpt-4o-mini") -> str:

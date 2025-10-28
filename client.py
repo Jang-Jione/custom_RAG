@@ -7,6 +7,10 @@ from rag import FileRAG
 from llm_api import query_gpt
 
 
+def is_github_url(path: str) -> bool:
+    return path.startswith("https://github.com/") or path.startswith("https://raw.githubusercontent.com/")
+
+
 async def run_session(target_dir: str):
     with open("mcp_server_config.json") as f:
         config = json.load(f)["mcpServers"]["filesystem_git"]
@@ -21,33 +25,48 @@ async def run_session(target_dir: str):
         session = await stack.enter_async_context(ClientSession(stdio, write))
         await session.initialize()
 
-        # 📂 파일 로딩
+        print(f"[INFO] 분석 대상: {target_dir}")
+
         file_dict = {}
+
+        # MCP 서버에 list_directory 요청
         resp = await session.call_tool("list_directory", {"path": target_dir})
-        files = resp.content[0].text.split("\n")
+        files_raw = resp.content[0].text.strip()
+        if not files_raw or files_raw.startswith("Error:"):
+            print(f"[ERROR] 디렉토리 탐색 실패: {files_raw}")
+            return
+        files = files_raw.split("\n")
 
         for fname in files:
             fname = fname.strip()
-            # ✅ PDF까지 지원
+            if not fname:
+                continue
+
             if fname.endswith((".py", ".md", ".txt", ".pdf")):
-                path = os.path.join(target_dir, fname)
+                if is_github_url(fname):
+                    path = fname
+                else:
+                    path = os.path.join(target_dir, fname)
+
                 if fname.lower().endswith(".pdf"):
-                    # PDF는 rag에서 텍스트 추출 → 경로만 넘김
                     file_dict[fname] = path
                 else:
-                    # 일반 텍스트 파일은 바로 읽어오기
-                    file_resp = await session.call_tool("read_file", {"path": path})
-                    content = file_resp.content[0].text
-                    file_dict[fname] = content
+                    try:
+                        file_resp = await session.call_tool("read_file", {"path": path})
+                        content = file_resp.content[0].text
+                        if content.startswith("Error:"):
+                            print(f"{fname} 읽기 실패: {content}")
+                        else:
+                            file_dict[fname] = content
+                    except Exception as e:
+                        print(f"{fname} 읽기 중 오류 발생: {e}")
 
-        print(f"총 {len(file_dict)}개 파일 로드 완료")
-        print("로드된 파일:", list(file_dict.keys()))
+        print(f"\n총 {len(file_dict)}개 파일 로드 완료")
+        print("로드된 파일:", list(file_dict.keys())[:10])
 
-        # 📌 RAG 인덱스 구축
         rag = FileRAG()
         rag.build_index(file_dict)
 
-        # 🔄 대화형 모드
         while True:
             user_input = input("\n❯ ").strip()
             if user_input.lower() == "exit":
@@ -55,7 +74,6 @@ async def run_session(target_dir: str):
                 del rag
                 break
 
-            # Git 명령어 처리
             if user_input.lower().startswith("status"):
                 result = await session.call_tool("git_status", {"cwd": target_dir})
                 print(result.content[0].text)
@@ -65,10 +83,12 @@ async def run_session(target_dir: str):
                 parts = user_input.split(" ", 1)
                 if len(parts) == 2:
                     msg = parts[1].strip('"')
-                    result = await session.call_tool("git_commit", {"message": msg, "cwd": target_dir})
+                    result = await session.call_tool(
+                        "git_commit", {"message": msg, "cwd": target_dir}
+                    )
                     print(result.content[0].text)
                 else:
-                    print("❌ commit 메시지를 입력하세요. 예: commit \"update docs\"")
+                    print("commit 메시지를 입력하세요. 예: commit \"update docs\"")
                 continue
 
             if user_input.lower().startswith("push"):
@@ -76,32 +96,31 @@ async def run_session(target_dir: str):
                 print(result.content[0].text)
                 continue
 
+            # ------------------ 파일 저장 ------------------
             if user_input.lower().startswith("save"):
-                # save filename.py
                 parts = user_input.split(" ", 1)
                 if len(parts) == 2:
                     fname = parts[1].strip()
                     print(f"저장할 파일명: {fname}")
-                    new_code = input("붙여넣을 코드 내용을 입력하세요 (끝내려면 빈 줄 입력):\n")
+                    print("붙여넣을 코드 내용을 입력하세요 (끝내려면 빈 줄 입력):")
                     buffer = []
-                    while new_code.strip() != "":
-                        buffer.append(new_code)
-                        new_code = input()
+                    while True:
+                        line = input()
+                        if not line.strip():
+                            break
+                        buffer.append(line)
                     content = "\n".join(buffer)
-
                     result = await session.call_tool(
                         "write_file",
-                        {"path": os.path.join(target_dir, fname), "content": content}
+                        {"path": os.path.join(target_dir, fname), "content": content},
                     )
                     print(result.content[0].text)
                 else:
-                    print("❌ 저장할 파일명을 입력하세요. 예: save test.py")
+                    print("저장할 파일명을 입력하세요. 예: save test.py")
                 continue
 
-            # GPT 분석 요청
+            # ------------------ GPT 분석 ------------------
             related_files = rag.search(user_input, top_k=3)
-
-            # ✅ rag.docs에서 본문 꺼내오기
             context_parts = []
             for fname in related_files:
                 for doc_fname, doc_text in rag.docs:
@@ -110,9 +129,8 @@ async def run_session(target_dir: str):
                         break
 
             context = "\n\n".join(context_parts)
-
             prompt = f"""
-            You are a coding assistant.  
+            You are a coding assistant.
 
             Here is the project context (code/files):
 
@@ -137,5 +155,4 @@ async def run_session(target_dir: str):
 
 if __name__ == "__main__":
     target_dir = sys.argv[1] if len(sys.argv) > 1 else "."
-    print(f"분석 대상 디렉토리: {target_dir}")
     asyncio.run(run_session(target_dir))
