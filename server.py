@@ -24,7 +24,7 @@ def list_directory(path: str = ".") -> str:
 def read_file(path: str) -> str:
     """파일 내용을 문자열로 반환"""
     try:
-        with open(path, "r", m="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
         return f"Error: {str(e)}"
