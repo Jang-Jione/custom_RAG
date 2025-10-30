@@ -24,7 +24,7 @@
     "file_contents": "G:\\CustomRAG 폴더의 파일을 RAG DB에 저장해줘.\nG:\\CustomRAG 폴더 내용을 https://github.com/Jang-Jione/custom_RAG에 push 해줘."
   },
   {
-    "file_name": "push_check.txt",
+    "file_name": "push_checker.txt",
     "file_contents": "# CustomRAG\n\nThis repository contains tools and scripts for the Custom RAG application including file indexing, reading, and GitHub integration."
   }
 ]
