@@ -1,144 +1,173 @@
-from mcp.server.fastmcp import FastMCP
+# server.py
 import os
+import json
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+from rag import FileRAG
+from github import Github
 import subprocess
-import requests
-
-mcp = FastMCP("PythonFS+Git+GitHub")
 
 
-def is_github_url(path: str) -> bool:
-    return path.startswith("https://github.com/")
+load_dotenv()
 
-def github_api_url(repo_url: str) -> str:
-    repo_url = repo_url.replace(".git", "")
-    parts = repo_url.split("/")
-    if len(parts) < 5:
-        raise ValueError("Invalid GitHub URL format.")
-    owner, repo = parts[3], parts[4]
-    subpath = "/".join(parts[5:]) if len(parts) > 5 else ""
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents"
-    if subpath:
-        api_url += f"/{subpath}"
-    return api_url
+mcp = FastMCP(
+    name="MCP-RAG-Agent",
+    instructions="Custom MCP server."
+)
 
-def fetch_github_directory(api_url: str):
-    resp = requests.get(api_url)
-    if resp.status_code != 200:
-        raise RuntimeError(f"GitHub API Error: {resp.status_code} {resp.text}")
-    items = resp.json()
-    file_list = []
-    for item in items:
-        if item["type"] == "file":
-            if item["name"].endswith((".py", ".md", ".txt", ".pdf")):
-                file_list.append(item["download_url"])
-        elif item["type"] == "dir":
-            file_list.extend(fetch_github_directory(item["url"]))
-    return file_list
-
-def fetch_github_file(download_url: str) -> str:
-    resp = requests.get(download_url)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Failed to fetch file: {download_url}")
-    return resp.text
+rag = FileRAG()
 
 
 @mcp.tool()
-def list_directory(path: str = ".") -> str:
-    try:
-        if is_github_url(path):
-            print(f"[GITHUB] listing files from {path}")
-            api_url = github_api_url(path)
-            file_list = fetch_github_directory(api_url)
-        else:
-            print(f"[LOCAL] listing files from {os.path.abspath(path)}")
-            EXCLUDE_DIRS = {".venv", "__pycache__", ".git", "node_modules", "dist", "build"}
-            file_list = []
-            for root, dirs, files in os.walk(path):
-                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-                for f in files:
-                    full_path = os.path.join(root, f)
-                    rel_path = os.path.relpath(full_path, path)
-                    if f.endswith((".py", ".md", ".txt", ".pdf")):
-                        file_list.append(rel_path)
-        return "\n".join(file_list)
-    except Exception as e:
-        return f"Error: {str(e)}"
-
+def list_directory(path: str) -> dict:
+    if not os.path.isdir(path):
+        return {"error": f"'{path}' is not valid dir."}
+    files = os.listdir(path)
+    return {"files": files}
 
 @mcp.tool()
-def read_file(path: str) -> str:
-    try:
-        if path.startswith("https://raw.githubusercontent.com/"):
-            return fetch_github_file(path)
-        elif is_github_url(path):
-            # https://github.com/user/repo/blob/main/file.py 형태 처리
-            if "/blob/" in path:
-                raw_url = (
-                    path.replace("github.com", "raw.githubusercontent.com")
-                        .replace("/blob/", "/")
-                )
-                return fetch_github_file(raw_url)
+def read_file(path: str) -> dict:
+    if not os.path.exists(path):
+        return {"error": f"file '{path}' can't find."}
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+    return {"content": content}
+
+@mcp.tool()
+def build_index_from_directory(path: str) -> dict:
+    if not os.path.isdir(path):
+        return {"error": f"'{path}' is not a valid directory."}
+
+    file_dict = {}
+    total_files = 0
+
+    for fname in os.listdir(path):
+        full_path = os.path.join(path, fname)
+        if not os.path.isfile(full_path):
+            continue
+
+        try:
+            ext = fname.lower().split(".")[-1]
+            text = ""
+
+            if ext == "pdf":
+                text = rag.pdf_to_text(full_path)
+            elif ext in ["py", "md", "txt", "json", "yaml", "yml"]:
+                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
             else:
-                # https://github.com/user/repo/... → API 변환 후 download_url 찾기
-                api_url = github_api_url(path)
-                resp = requests.get(api_url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, dict) and "download_url" in data:
-                        return fetch_github_file(data["download_url"])
-                raise RuntimeError(f"Invalid GitHub file path: {path}")
-        else:
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
-    except Exception as e:
-        return f"Error: {str(e)}"
+                continue 
+
+            if text.strip():
+                file_dict[fname] = text
+                total_files += 1
+            else:
+                print(f"[SKIP] {fname}: empty text")
+
+        except Exception as e:
+            print(f"[WARN] {fname} failed: {e}")
+            continue
+
+    if not file_dict:
+        return {"error": "No valid files found for indexing."}
+
+    rag.build_index(file_dict)
+    return {"message": f"{total_files} files indexed successfully."}
 
 
 @mcp.tool()
-def write_file(path: str, content: str) -> str:
+def build_index_from_github(url: str) -> dict:
     try:
-        if is_github_url(path):
-            return "GitHub 원격 레포에는 직접 쓰기가 불가능합니다."
+        if "github.com" not in url:
+            return {"error": "is not valid GitHub URL."}
+
+        repo_path = url.split("github.com/")[-1].split("/tree")[0].strip("/")
+        g = Github(os.getenv("GITHUB_TOKEN"))
+        repo = g.get_repo(repo_path)
+
+        file_dict = {}
+        stack = repo.get_contents("")
+
+        while stack:
+            file_content = stack.pop(0)
+            if file_content.type == "dir":
+                stack.extend(repo.get_contents(file_content.path))
+            elif file_content.type == "file":
+                fname = file_content.path
+                try:
+                    if fname.lower().endswith((".py", ".c", ".md", ".txt", ".json", ".yaml", ".yml")):
+                        text = file_content.decoded_content.decode("utf-8", errors="ignore")
+                        if text.strip():
+                            file_dict[fname] = text
+                except Exception as e:
+                    print(f"[WARN] {fname} fail: {e}")
+                    continue
+
+        if not file_dict:
+            return {"error": f"'{repo_path}' can't find."}
+
+        rag.build_index(file_dict)
+        return {"message": f"GitHub: '{repo_path}', {len(file_dict)} indexing complete."}
+
+    except Exception as e:
+        return {"error": f"GitHub indexing fail: {str(e)}"}
+
+
+@mcp.tool()
+def search_in_index(query: str, top_k: int = 3) -> dict:
+    try:
+        results = rag.search(query, top_k=top_k)
+        return {"results": results}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def write_file(path: str, content: str) -> dict:
+    try:
+        folder = os.path.dirname(path)
+        if not os.path.exists(folder):
+            os.makedirs(folder, exist_ok=True)
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"{path} 저장 완료"
+        return {"message": f"file save: {path}"}
     except Exception as e:
-        return f"Error: {str(e)}"
+        return {"error": str(e)}
 
 
 @mcp.tool()
-def git_status(cwd: str = ".") -> str:
+def git_commit_and_push(repo_path: str, commit_message: str, remote_url: str) -> dict:
     try:
-        result = subprocess.run(["git", "-C", cwd, "status"], capture_output=True, text=True, check=True)
-        return result.stdout
-    except Exception as e:
-        return f"Error: {str(e)}"
+        if not os.path.isdir(repo_path):
+            return {"error": f"{repo_path} is not a valid directory."}
 
+        username = os.getenv("GITHUB_USERNAME")
+        token = os.getenv("GITHUB_TOKEN")
+        if not username or not token:
+            return {"error": "GitHub Authentication info missing."}
 
-@mcp.tool()
-def git_commit(message: str, cwd: str = ".") -> str:
-    try:
-        subprocess.run(["git", "-C", cwd, "add", "."], check=True)
-        result = subprocess.run(
-            ["git", "-C", cwd, "commit", "-m", message],
-            capture_output=True, text=True, check=True
+        auth_url = remote_url.replace(
+            "https://",
+            f"https://{username}:{token}@"
         )
-        return result.stdout
-    except Exception as e:
-        return f"Error: {str(e)}"
 
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", commit_message], check=False)
+        subprocess.run(["git", "-C", repo_path, "push", auth_url, "--force"], check=True)
 
-@mcp.tool()
-def git_push(cwd: str = ".") -> str:
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "push"],
-            capture_output=True, text=True, check=True
-        )
-        return result.stdout
+        return {"message": f"✅ '{commit_message}' pushed to {remote_url}!"}
+
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Git command error: {e}"}
     except Exception as e:
-        return f"Error: {str(e)}"
+        return {"error": str(e)}
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=8000,
+        path="/mcp",
+    )

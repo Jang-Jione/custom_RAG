@@ -1,158 +1,249 @@
-import json, os, sys, asyncio
-from contextlib import AsyncExitStack
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+import os, json, uuid, requests
+from dotenv import load_dotenv
+from openai import OpenAI
 
-from rag import FileRAG
-from llm_api import query_gpt
-
-
-def is_github_url(path: str) -> bool:
-    return path.startswith("https://github.com/") or path.startswith("https://raw.githubusercontent.com/")
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MCP_URL = "http://127.0.0.1:8000/mcp"
+session_id: str | None = None 
 
 
-async def run_session(target_dir: str):
-    with open("mcp_server_config.json") as f:
-        config = json.load(f)["mcpServers"]["filesystem_git"]
+def init_mcp_session():
+    global session_id
+    if session_id is not None:
+        return session_id  
 
-    server_params = StdioServerParameters(
-        command=config["command"],
-        args=config["args"]
-    )
+    payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "capabilities": {"tools": True},
+            "clientInfo": {"name": "local-client", "version": "0.1"}
+        }
+    }
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json"
+    }
 
-    async with AsyncExitStack() as stack:
-        stdio, write = await stack.enter_async_context(stdio_client(server_params))
-        session = await stack.enter_async_context(ClientSession(stdio, write))
-        await session.initialize()
+    r = requests.post(MCP_URL, json=payload, headers=headers, timeout=10)
+    r.raise_for_status()
 
-        print(f"[INFO] 분석 대상: {target_dir}")
+    sid = r.headers.get("Mcp-Session-Id")
+    if not sid:
+        raise RuntimeError("Session ID issue.")
+    session_id = sid
+    print(f"✅ MCP Sesseion Build!: {session_id}")
 
-        file_dict = {}
+    notify = {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    }
+    headers["Mcp-Session-Id"] = sid
+    requests.post(MCP_URL, json=notify, headers=headers, timeout=5)
+    return sid
 
-        # MCP 서버에 list_directory 요청
-        resp = await session.call_tool("list_directory", {"path": target_dir})
-        files_raw = resp.content[0].text.strip()
-        if not files_raw or files_raw.startswith("Error:"):
-            print(f"[ERROR] 디렉토리 탐색 실패: {files_raw}")
-            return
-        files = files_raw.split("\n")
 
-        for fname in files:
-            fname = fname.strip()
-            if not fname:
-                continue
+def call_mcp_tool(name: str, args: dict):
+    global session_id
+    if session_id is None:
+        init_mcp_session()
 
-            if fname.endswith((".py", ".md", ".txt", ".pdf")):
-                if is_github_url(fname):
-                    path = fname
-                else:
-                    path = os.path.join(target_dir, fname)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tools/call",
+        "params": {"name": name, "arguments": args}
+    }
 
-                if fname.lower().endswith(".pdf"):
-                    file_dict[fname] = path
-                else:
-                    try:
-                        file_resp = await session.call_tool("read_file", {"path": path})
-                        content = file_resp.content[0].text
-                        if content.startswith("Error:"):
-                            print(f"{fname} 읽기 실패: {content}")
-                        else:
-                            file_dict[fname] = content
-                    except Exception as e:
-                        print(f"{fname} 읽기 중 오류 발생: {e}")
+    print("\n=== [JSON-RPC Request] ===")
+    print(json.dumps(payload, indent=2, ensure_ascii=False)) 
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "Mcp-Session-Id": session_id
+    }
 
-        print(f"\n총 {len(file_dict)}개 파일 로드 완료")
-        print("로드된 파일:", list(file_dict.keys())[:10])
+    with requests.post(MCP_URL, json=payload, headers=headers, stream=True, timeout=100) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"ERROR: {r.status_code} {r.text}")
 
-        rag = FileRAG()
-        rag.build_index(file_dict)
+        data_lines = []
+        for line in r.iter_lines(decode_unicode=True):
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
 
-        while True:
-            user_input = input("\n❯ ").strip()
-            if user_input.lower() == "exit":
-                print("세션 종료, DB 삭제 완료")
-                del rag
-                break
+        if not data_lines:
+            return {"error": "response is empty."}
 
-            if user_input.lower().startswith("status"):
-                result = await session.call_tool("git_status", {"cwd": target_dir})
-                print(result.content[0].text)
-                continue
+        raw = "\n".join(data_lines)
+        try:
+            outer = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"raw": raw}
 
-            if user_input.lower().startswith("commit"):
-                parts = user_input.split(" ", 1)
-                if len(parts) == 2:
-                    msg = parts[1].strip('"')
-                    result = await session.call_tool(
-                        "git_commit", {"message": msg, "cwd": target_dir}
-                    )
-                    print(result.content[0].text)
-                else:
-                    print("commit 메시지를 입력하세요. 예: commit \"update docs\"")
-                continue
+        if isinstance(outer, dict) and "result" in outer:
+            content = outer["result"].get("content", [])
+            if content and "text" in content[0]:
+                raw_text = content[0]["text"]
+                try:
+                    data = json.loads(raw_text)
+                    if isinstance(data, str):
+                        data = json.loads(data)
+                    return data
+                except json.JSONDecodeError:
+                    return {"raw": raw_text}
 
-            if user_input.lower().startswith("push"):
-                result = await session.call_tool("git_push", {"cwd": target_dir})
-                print(result.content[0].text)
-                continue
+def chat_with_mcp():
+    init_mcp_session()
 
-            # ------------------ 파일 저장 ------------------
-            if user_input.lower().startswith("save"):
-                parts = user_input.split(" ", 1)
-                if len(parts) == 2:
-                    fname = parts[1].strip()
-                    print(f"저장할 파일명: {fname}")
-                    print("붙여넣을 코드 내용을 입력하세요 (끝내려면 빈 줄 입력):")
-                    buffer = []
-                    while True:
-                        line = input()
-                        if not line.strip():
-                            break
-                        buffer.append(line)
-                    content = "\n".join(buffer)
-                    result = await session.call_tool(
-                        "write_file",
-                        {"path": os.path.join(target_dir, fname), "content": content},
-                    )
-                    print(result.content[0].text)
-                else:
-                    print("저장할 파일명을 입력하세요. 예: save test.py")
-                continue
+    messages = [
+        {
+            "role": "system",
+            "content": "너는 로컬 RAG MCP 서버의 도구를 활용할 수 있는 AI야. 사용자가 파일 검색, 파일 작성 등의 작업을 요청하면 MCP 도구를 호출해야 해."
+        }
+    ]
 
-            # ------------------ GPT 분석 ------------------
-            related_files = rag.search(user_input, top_k=3)
-            context_parts = []
-            for fname in related_files:
-                for doc_fname, doc_text in rag.docs:
-                    if doc_fname == fname:
-                        context_parts.append(f"[{fname}]\n{doc_text}")
-                        break
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "로컬 폴더의 파일 목록을 가져옵니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "build_index_from_directory",
+                "description": "폴더 내 파일을 인덱싱합니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "build_index_from_github",
+                "description": "깃허브 URL을 RAG 인덱스로 구축합니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_in_index",
+                "description": "RAG 인덱스에서 쿼리를 검색합니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "git_commit_and_push",
+                "description": "로컬 폴더의 변경사항을 커밋하고 지정한 원격 저장소 URL로 푸시합니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {
+                            "type": "string",
+                            "description": "로컬 Git 저장소의 경로"
+                        },
+                        "commit_message": {
+                            "type": "string",
+                            "description": "커밋 메시지"
+                        },
+                        "remote_url": {
+                            "type": "string",
+                            "description": "원격 저장소의 HTTPS 또는 SSH URL (예: https://github.com/user/repo.git)"
+                        }
+                    },
+                    "required": ["repo_path", "commit_message", "remote_url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "지정된 경로에 파일을 작성합니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }
+    ]
 
-            context = "\n\n".join(context_parts)
-            prompt = f"""
-            You are a coding assistant.
+    print("Session start (escape: quit, exit)\n")
+    while True:
+        user_input = input("💬 Prompt: ")
+        if user_input.strip().lower() in {"exit", "quit"}:
+            print("MCP session finish!")
+            break
 
-            Here is the project context (code/files):
+        messages.append({"role": "user", "content": user_input})
 
-            {context}
+        chat_kwargs = {
+            "model": "gpt-4o-mini",
+            "messages": messages,
+            "tool_choice": "auto",
+            "tools": tools
+        }
 
-            ---
+        res = client.chat.completions.create(**chat_kwargs)
+        msg = res.choices[0].message
 
-            User request: {user_input}
+        if not msg.tool_calls:
+            print("", msg.content)
+            messages.append({"role": "assistant", "content": msg.content})
+            continue
 
-            ---
+        for call in msg.tool_calls:
+            fn_name = call.function.name
+            fn_args = json.loads(call.function.arguments)
+            print(f"[MCP request] {fn_name}({fn_args})")
+            tool_output = call_mcp_tool(fn_name, fn_args)
+            # print(f"[MCP response] {tool_output}")
+            print(f"[MCP response] success")
 
-            Task:
-            - Use the given context (code/files) as the primary source of information.
-            - Answer the user request clearly and accurately.
-            - If the request is about improvements, suggest concrete and actionable improvements to the code.
-            - If the request is about explanation, explain the relevant parts of the code step by step.
-            - Answer in Korean.
-            """
-            analysis = query_gpt(prompt)
-            print(analysis)
+            messages += [
+                {"role": "assistant", "content": None, "tool_calls": [call.model_dump()]},
+                {"role": "tool", "tool_call_id": call.id, "name": fn_name,
+                 "content": json.dumps(tool_output, ensure_ascii=False)}
+            ]
+        
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages
+        )
+        final_msg = res.choices[0].message
+        print("🧠 GPT:", final_msg.content)
+        messages.append({"role": "assistant", "content": final_msg.content})
 
 
 if __name__ == "__main__":
-    target_dir = sys.argv[1] if len(sys.argv) > 1 else "."
-    asyncio.run(run_session(target_dir))
+    chat_with_mcp()
