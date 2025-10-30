@@ -1,0 +1,2 @@
+G:\CustomRAG 폴더의 파일을 RAG DB에 저장해줘.
+G:\CustomRAG 폴더 내용을 https://github.com/Jang-Jione/custom_RAG에 push 해줘.

@@ -65,7 +65,7 @@ class FileRAG:
         print(f"[BUILD DONE] {len(texts)} files indexed.")
 
 
-    def search(self, query, top_k=5):
+    def search(self, query, top_k=6):
         if self.index is None:
             raise RuntimeError("FAISS must be initialized before searching.")
 

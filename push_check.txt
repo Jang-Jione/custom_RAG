@@ -1,0 +1,3 @@
+# CustomRAG
+
+This repository contains tools and scripts for the Custom RAG application including file indexing, reading, and GitHub integration.
